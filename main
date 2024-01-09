@@ -1,0 +1,269 @@
+from aiogram import Dispatcher, Bot, types
+from aiogram.utils import executor
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+import sqlite3
+from config import *
+from States import *
+
+
+bot = Bot(token)
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+
+@dp.message_handler(commands=['start'])
+async def bot_start(message: types.Message):
+    db = sqlite3.connect('users.db')  # База данных
+    sql = db.cursor()
+    sql.execute(
+        """CREATE TABLE IF NOT EXISTS users(
+                id INTEGER,
+                idzametki INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                info TEXT
+            )"""
+    )
+    db.commit()
+
+    startkb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    startkb.add(
+        types.KeyboardButton("Добавить заметку"),
+        types.KeyboardButton("Мои заметки"),
+        types.KeyboardButton("Найти заметку")
+
+    )
+    await bot.send_message(message.chat.id, text="Бот для заметок", reply_markup=startkb)
+
+
+@dp.message_handler(content_types=["text"])
+async def add_zametka(message: types.Message, state: FSMContext):  # Получение название заметки
+    if message.text == "Добавить заметку":
+        await Information.name.set()
+        await bot.send_message(message.chat.id, text="Введите заголовок заметки")
+    elif message.text == "Мои заметки": # Заметки в виде Inline кнопок
+        db = sqlite3.connect("users.db")
+        sql = db.cursor()
+        data = sql.execute(f"SELECT * FROM users WHERE id = {message.chat.id}").fetchall()
+
+        if not data:
+            await bot.send_message(message.chat.id, text="У вас нет заметок :(")
+        else:
+            zametki = types.InlineKeyboardMarkup(row_width=1)
+            for i in data:
+                zametki.add(types.InlineKeyboardButton(f'{i[2]}', callback_data=f"zametka_{i[1]}"))
+            await bot.send_message(message.chat.id, text="Ваши заметки:", reply_markup=zametki)
+    elif message.text == "Найти заметку":
+        await Information.word.set()
+        await bot.send_message(message.chat.id, text = "Введите слово")
+
+
+@dp.message_handler(content_types=["text"], state=Information.name)
+async def add_zametka_2(message: types.Message, state: FSMContext):  # Получение информацию заметки
+    async with state.proxy() as data:
+        data['name'] = message.text
+    await Information.info.set()
+    await bot.send_message(message.chat.id, text = f"Название заметки: {data['name']}\nВведите информацию заметки")
+
+@dp.message_handler(content_types=["text"], state=Information.word)
+async def find_word(message: types.Message, state: FSMContext):  # Получение информацию заметки
+    async with state.proxy() as data:
+        data['word'] = message.text
+    db = sqlite3.connect('users.db')  # Подключение к базе данных
+    sql = db.cursor()
+    answer = sql.execute("SELECT * FROM users WHERE name LIKE ? OR info LIKE ?", (f'%'+data['word']+'%', '%'+data['word']+'%')).fetchall()
+    db.commit()
+    if not answer:
+        await bot.send_message(message.chat.id, text = "Ничего не найдено")
+        await state.finish()
+    else:
+        zametki = types.InlineKeyboardMarkup(row_width=1)
+        for i in answer:
+            zametki.add(types.InlineKeyboardButton(f'{i[2]}', callback_data=f"zametka_{i[1]}"))
+        await bot.send_message(message.chat.id, text=f"Ваши заметки, где есть слово: {data['word']}", reply_markup=zametki)
+        await state.finish()
+
+@dp.message_handler(content_types=["text"], state=Information.info)
+async def create_zametka(message: types.Message, state: FSMContext):  # Создание заметки и занесение в базу данных
+    async with state.proxy() as data:
+        db = sqlite3.connect('users.db')
+        sql = db.cursor()
+
+        name = data['name']
+        info = message.text
+
+        sql.execute("INSERT OR IGNORE INTO users (id, name, info) VALUES (?,?,?)", (message.chat.id, name, info))
+        db.commit()
+        db.close()
+
+        await bot.send_message(message.chat.id, text = f"Ваша заметка создана!\nЗаголовок заметки: {name}\nСодержание заметки: {info}")
+        await state.finish()
+
+################################# Работа с удалением/редактированием заметок #################################
+        
+
+@dp.callback_query_handler(lambda c: c.data.startswith('zametka'))
+async def my_zametka_check(callback_query: types.CallbackQuery):  # Выбор действий с заметкой
+    zametki = callback_query.data.split('_')[1]
+    db = sqlite3.connect("users.db")
+    sql = db.cursor()
+    data = sql.execute("SELECT * FROM users WHERE idzametki = ?", (zametki,)).fetchone()
+    db.commit()
+    db.close()
+
+    zametkabt = types.InlineKeyboardMarkup(row_width=2)
+    zametkabt.add(
+        types.InlineKeyboardButton("Редактировать", callback_data=f"edit_{zametki}"),
+        types.InlineKeyboardButton("Удалить", callback_data=f"delete_{zametki}"),
+        types.InlineKeyboardButton("Назад", callback_data=f"back")
+    )
+
+    await bot.edit_message_text(
+        chat_id=callback_query.from_user.id,
+        message_id=callback_query.message.message_id,
+        text=f"Название заметки: {data[2]}\nИнформация в заметке: {data[3]}",
+        reply_markup=zametkabt
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith('delete')) # Подтверждение удаления
+async def my_zametka_delete(callback_query: types.CallbackQuery):
+    zametki = callback_query.data.split('_')[1]
+
+    db = sqlite3.connect("users.db")
+    sql = db.cursor()
+    data = sql.execute("SELECT * FROM users WHERE idzametki = ?", (zametki,)).fetchone()
+
+
+    deletebtn = types.InlineKeyboardMarkup(row_width=2)
+    deletebtn.add (
+        types.InlineKeyboardButton("Да", callback_data=f"deleting_{zametki}_yes"),
+        types.InlineKeyboardButton("Нет", callback_data=f"deleting_{zametki}_no")
+    )
+    await bot.edit_message_text(
+        chat_id=callback_query.from_user.id,
+        message_id=callback_query.message.message_id,
+        text=f"Вы уверены, что хотите удалить заметку с названием {data[2]}?",
+        reply_markup=deletebtn
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith('deleting')) # Отвечаем на решение пользователя
+async def my_zametka_delete(callback_query: types.CallbackQuery):
+    parts = callback_query.data.split('_', 2)
+    zametki = parts[1]
+    answer = parts[2]
+
+    db = sqlite3.connect("users.db")
+    sql = db.cursor()
+
+    if answer == "yes":
+        sql.execute("DELETE FROM users WHERE idzametki = ?", (zametki,))
+        db.commit()
+        db.close()
+        dltbtn = types.InlineKeyboardMarkup(row_width=1)
+        deletebtn1 = types.InlineKeyboardButton("Вернуться назад", callback_data="back")
+        dltbtn.add(deletebtn1)
+        await bot.edit_message_text(
+        chat_id=callback_query.from_user.id,
+        message_id=callback_query.message.message_id,
+        text=f"Заметка удалена!",
+        reply_markup=dltbtn
+    )
+    elif answer == "no":
+        gozametka = types.InlineKeyboardMarkup(row_width=1)
+        gozametka1 = types.InlineKeyboardButton("К заметке", callback_data=f"zametka_{zametki}",)
+        gozametka.add(gozametka1)
+        await bot.edit_message_text(
+        chat_id=callback_query.from_user.id,
+        message_id=callback_query.message.message_id,
+        text=f"Действие отменено!",
+        reply_markup=gozametka
+        )
+
+@dp.callback_query_handler(text="back")  # Возвращение назад
+async def my_zametki_back(callback_query: types.CallbackQuery):
+    db = sqlite3.connect("users.db")
+    sql = db.cursor()
+
+    data = sql.execute(f"SELECT * FROM users WHERE id = {callback_query.message.chat.id}").fetchall()
+
+    zametki = types.InlineKeyboardMarkup(row_width=1)
+
+    if not data:
+        await bot.edit_message_text(
+        chat_id=callback_query.from_user.id,
+        message_id=callback_query.message.message_id,
+        text=f"У вас нету заметок :("
+        )
+    for i in data:
+        zametki.add(types.InlineKeyboardButton(f'{i[2]}', callback_data=f"zametka_{i[1]}"))
+        await bot.edit_message_text(chat_id=callback_query.from_user.id, message_id=callback_query.message.message_id,
+                               text="Ваши заметки:", reply_markup=zametki)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('edit'))  # Выбор, что хочет изменить пользователь
+async def my_zametka_edit(callback_query: types.CallbackQuery):
+    edit = callback_query.data.split('_')[1]
+    editbt1 = types.InlineKeyboardMarkup(row_width=2)
+
+    editbt1.add(
+        types.InlineKeyboardButton("Заголовок", callback_data=f"name_{edit}"),
+        types.InlineKeyboardButton("Содержание", callback_data=f"info_{edit}")
+    )
+
+    await bot.edit_message_text(chat_id=callback_query.from_user.id, message_id=callback_query.message.message_id,
+                                 text="Что нужно изменить?", reply_markup=editbt1)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('info'), state="*")  # Запрос нового названия заметки
+async def my_zametka_edit_info(callback_query: types.CallbackQuery, state: FSMContext):
+    zametka_id = callback_query.data.split('_')[1]
+    await bot.edit_message_text(chat_id=callback_query.from_user.id, message_id=callback_query.message.message_id,
+                                 text="Введите новое содержание заметки:")
+    await state.update_data(edit_id=zametka_id, edit_type='info')
+    await InformationEdit.editinfo.set()
+
+
+@dp.message_handler(state=InformationEdit.editinfo, content_types=types.ContentTypes.TEXT)  # Изменение информации в заметке
+async def my_zametka_editing_info(message: types.Message, state: FSMContext):
+    new_name = message.text
+    data = await state.get_data()
+    edit_id = data.get('edit_id')
+
+    db = sqlite3.connect("users.db")
+    sql = db.cursor()
+
+    sql.execute("UPDATE users SET info = ? WHERE idzametki = ?", (new_name, edit_id))
+    db.commit()
+    db.close()
+
+    await state.finish()
+    await bot.send_message(message.chat.id, "Содержание заметки успешно обновлено!")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('name'), state="*")  # Запрос нового названия заметки
+async def my_zametka_edit_name(callback_query: types.CallbackQuery, state: FSMContext):
+    zametka_id = callback_query.data.split('_')[1]
+    await bot.edit_message_text(chat_id=callback_query.from_user.id, 
+                                message_id=callback_query.message.message_id,
+                                text="Введите новый заголовок заметки:")
+    await state.update_data(edit_id=zametka_id, edit_type='name')
+    await InformationEdit.editname.set()
+
+
+@dp.message_handler(state=InformationEdit.editname, content_types=types.ContentTypes.TEXT)  # Изменение названия заметки
+async def my_zametka_editing_name(message: types.Message, state: FSMContext):
+    new_name = message.text
+    data = await state.get_data()
+    edit_id = data.get('edit_id')
+
+    db = sqlite3.connect("users.db")
+    sql = db.cursor()
+
+    sql.execute("UPDATE users SET name = ? WHERE idzametki = ?", (new_name, edit_id))
+    db.commit()
+    db.close()
+
+    await state.finish()
+    await bot.send_message(message.chat.id, "Заголовок заметки успешно обновлен!")
+
+
+if __name__ == '__main__':
+    executor.start_polling(dp)
